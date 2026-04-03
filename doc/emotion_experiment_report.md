@@ -222,8 +222,11 @@ End-to-end training with LoRA adapters on top 6 transformer layers (18-23), targ
 | LoRA v2 r64 | 64 | RAVDESS+CREMA-D | 8 | 5e-5 / 5e-4 | 62.5% | 61.8% | 30 |
 | LoRA v2 r64 resumed | 64 | RAVDESS+CREMA-D | 8 | 5e-5 / 5e-4 | 65.8% | 65.3% | 47 |
 | LoRA combined r128 | 128 | All 3 | 16 | 5e-5 / 5e-4 | 63.4% | 63.2% | 21 (stopped) |
+| **LoRA augmented r128** | **128** | **RAVDESS+CREMA-D + elderly aug** | **8** | **1e-5 / 1e-4** | **69.4%** | **69.0%** | **16 (from v1 weights)** |
 
-**Production model:** LoRA r128 on RAVDESS+CREMA-D, 68.9% accuracy, merged into backbone, deployed as care-whisper-ser sidecar on port 3031.
+**Production model (v2, current):** LoRA r128 + elderly voice augmentation on RAVDESS+CREMA-D, 69.4% val accuracy, 70.7% TESS, 96.0% fear. Deployed 2026-04-03.
+
+**Production model (v1, replaced):** LoRA r128 on RAVDESS+CREMA-D, 68.9% val accuracy, 68.6% TESS, 98.8% fear. Deployed 2026-03-31.
 
 ### LoRA Combined r128 Training Curve (RAVDESS+CREMA-D+IEMOCAP)
 
@@ -275,7 +278,29 @@ TESS (Toronto Emotional Speech Set) is completely unseen during training. Two sp
 
 **Key finding:** The temporal head achieves higher val accuracy (70.2% vs 68.9%) but **worse out-of-domain generalization**, especially for fear (98.8% → 34.0%). The simpler mean-pool head is more robust to unseen speakers and domains. The temporal model's BiLSTM likely overfits to temporal patterns specific to the training data (RAVDESS/CREMA-D acted speech timing) that don't transfer to TESS's different recording conditions.
 
-**Decision:** Production model (mean-pool MLP) retained. Val accuracy alone is insufficient — out-of-domain evaluation on TESS is the better indicator for deployment robustness, especially for fear detection in elderly speech.
+**Decision:** Temporal head rejected. Val accuracy alone is insufficient — out-of-domain evaluation on TESS is the better indicator for deployment robustness, especially for fear detection in elderly speech.
+
+#### Augmented Model (LoRA r128, mean-pool MLP, elderly voice augmentation) — CURRENT PRODUCTION
+
+| Class | Overall | OAF (64yo) | YAF (26yo) |
+|-------|---------|-----------|-----------|
+| neutral | 61.2% | — | — |
+| happy | 60.8% | — | — |
+| sad | 72.5% | — | — |
+| angry | **34.0%** | — | — |
+| **fear** | **96.0%** | — | — |
+| **disgust** | **99.5%** | — | — |
+| **Total** | **70.7%** | **56.8%** | **84.6%** |
+
+**Key improvements over v1 production:**
+- Overall TESS: 68.6% → **70.7%** (+2.1%)
+- Angry: 7.8% → **34.0%** (+26.2%) — previously nearly broken, now usable
+- YAF (26yo): 81.2% → **84.6%** (+3.4%)
+- OAF (64yo): 56.0% → **56.8%** (+0.8%) — marginal elderly improvement
+- Fear: 98.8% → 96.0% (-2.8%) — slight dip but still excellent
+- Val accuracy: 68.9% → **69.4%** (+0.5%)
+
+**Decision:** Augmented model promoted to production (2026-04-03). The elderly augmentation improved overall generalization and fixed the angry class collapse, with only a small fear trade-off (96% is still clinically sufficient).
 
 ---
 
@@ -444,6 +469,58 @@ Uses neuralset's cached extraction pipeline with exca caching.
 - `tribev2/emotion/pl_module.py` — ClassificationModule (Lightning)
 
 ### Saved Models
-- `~/data/emotion_save/results/tribe_emotion_lora_r128/merged_model.pt` — **Production model (68.9%)**
+- `~/data/emotion_save/results/tribe_emotion_lora_augmented_r128/merged_model.pt` — **Production model v2 (69.4% val, 70.7% TESS)**
+- `~/data/emotion_save/results/tribe_emotion_lora_r128/merged_model.pt` — Production model v1 (68.9% val, 68.6% TESS)
+- `~/data/emotion_save/results/tribe_emotion_lora_temporal_r128/merged_model.pt` — Temporal head experiment (70.2% val, 64.5% TESS)
 - `~/data/emotion_save/results/tribe_emotion_lora_combined_r128/best_lora.pt` — Combined best (63.4%)
-- `~/containers/care-whisper-ser/models/best_model.pt` — Symlink to production model
+- `~/containers/care-whisper-ser/models/best_model.pt` — Symlink to production model v2
+
+---
+
+## 7. Next Steps: Elderly Voice Augmentation
+
+### Problem
+
+The production model shows a 25-point accuracy gap between the younger and older TESS speakers:
+- YAF (26yo): 81.2%
+- OAF (64yo): 56.0%
+
+All training data (RAVDESS + CREMA-D) uses speakers aged 20-74, with the majority under 50. The model has limited exposure to elderly voice characteristics, causing degraded performance on older speakers.
+
+### Approach: Simulate Aging Voice Characteristics
+
+Apply audio augmentations to the RAVDESS+CREMA-D training clips to synthesize elderly-sounding variants. Three key characteristics of aging voices:
+
+1. **Lower fundamental frequency / reduced pitch range** — vocal fold stiffening and thinning reduces F0 and narrows the pitch contour. Simulate with pitch shifting (-1 to -3 semitones) and F0 range compression.
+
+2. **Slower speaking rate** — reduced motor control and cognitive processing speed. Simulate with time stretching (1.1x to 1.3x duration) without pitch change.
+
+3. **Increased jitter/shimmer (vocal tremor)** — neuromuscular degeneration causes micro-perturbations in pitch and amplitude. Simulate with low-frequency modulation of F0 (3-7 Hz tremor) and amplitude variation.
+
+### Implementation Plan
+
+- Create `tribev2/emotion/augment_elderly.py` that generates augmented copies of training clips
+- Apply augmentations with random parameters per clip (pitch shift, rate, tremor intensity)
+- Augmented clips added to training set alongside originals (not replacing them)
+- Retrain LoRA r128 with mean-pool head (the production architecture)
+- Evaluate on TESS, specifically measuring OAF (64yo) improvement
+
+### Success Criteria
+
+- OAF (64yo) accuracy improves from 56.0% toward YAF's 81.2%
+- Fear detection stays above 90% on TESS (currently 98.8%)
+- Overall TESS accuracy improves from 68.6%
+
+### Results (2026-04-03)
+
+Augmentation completed: 7,107 training clips augmented (100% success rate). Fine-tuned from production v1 weights with lower LR (1e-5 LoRA, 1e-4 head) for 20 epochs.
+
+| Metric | Before (v1) | After (v2 augmented) | Change |
+|--------|------------|---------------------|--------|
+| Val accuracy | 68.9% | **69.4%** | +0.5% |
+| TESS overall | 68.6% | **70.7%** | +2.1% |
+| TESS OAF (64yo) | 56.0% | 56.8% | +0.8% |
+| TESS angry | 7.8% | **34.0%** | +26.2% |
+| TESS fear | 98.8% | 96.0% | -2.8% |
+
+The elderly speaker gap (OAF vs YAF) only closed by 0.8 points. The augmentation helped general robustness more than elderly-specific performance. The pitch/rate/tremor simulation may not capture the full complexity of elderly voice characteristics. More targeted augmentation or real elderly data would be needed to close the 28-point gap further.
